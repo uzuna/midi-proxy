@@ -1,19 +1,13 @@
 use std::path::PathBuf;
 
+use bytes::Bytes;
 use clap::Parser;
-use midi_proxy::{MidiMessage, MidiMessageStampled, handle_connection};
-use midir::{
-    MidiInput, MidiOutput,
-    os::unix::{VirtualInput, VirtualOutput},
+use futures::{SinkExt, StreamExt};
+use midi_proxy::{
+    ConnectionIdent, Message, MessageDetail, MidiMessage, OutputMessage, Registry, Server,
 };
-use tokio::{
-    net::TcpStream,
-    sync::{broadcast, mpsc},
-};
-use tokio_util::{
-    codec::{Framed, LengthDelimitedCodec},
-    sync::CancellationToken,
-};
+use tokio::{net::TcpStream, sync::mpsc, task::LocalSet};
+use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing::{error, info};
 
 #[derive(Debug, Parser)]
@@ -25,125 +19,116 @@ struct Args {
 
     /// Port number to listen for MIDI messages
     #[arg(short = 'p', long, env = "MIDI_TCP_PORT")]
-    listen_port: Option<u16>,
+    port: Option<u16>,
 
     /// TCP接続先情報を記述したTOMLファイルへのパス
-    #[arg(long)]
-    links: Option<PathBuf>,
+    #[arg(short, long, env = "MIDI_PROXY_CONFIG")]
+    config: Option<PathBuf>,
+}
+
+/// ライブラリの初期化関数
+pub fn init() {
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    init();
     let args = Args::parse();
-    let name = args.name;
-    let midi_in_client = MidiInput::new(&format!("{} Input Client", name))?;
-    let midi_out_client = MidiOutput::new(&format!("{} Output Client", name))?;
 
-    // Receive from Local MIDI Input
-    let (tx_in, rx_in) = broadcast::channel::<MidiMessageStampled>(16);
-    let _conn_in = midi_in_client
-        .create_virtual(
-            &format!("{} Input Port", name),
-            move |stamp, message, _| {
-                let msg = MidiMessageStampled::try_from((stamp, message));
-                if let Ok(msg) = msg {
-                    let _ = tx_in.send(msg);
-                };
-            },
-            (),
-        )
-        .map_err(|e| anyhow::anyhow!("failed to create MIDI Virtual Device: {}", e))?;
+    let (reg, tx, rx, task) = Registry::new(args.name)?;
+    let mut server = Server::new(reg, rx);
 
-    let (tx_out, mut rx_out) = mpsc::channel::<MidiMessage>(16);
-    let mut conn_out = midi_out_client
-        .create_virtual(&format!("{} Output Port", name))
-        .map_err(|e| anyhow::anyhow!("failed to create MIDI Virtual Device: {}", e))?;
-
-    // Forward to Local MIDI Output
-    let mut local_input = rx_in.resubscribe();
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                Ok(msg) = local_input.recv() => {
-                    info!("Received MIDI message: {}", msg);
-                    if let Err(e) = conn_out.send(msg.message.as_ref()) {
-                        error!("Failed to send MIDI message: {}", e);
-                    }
-                }
-                Some(msg) = rx_out.recv() => {
-                    info!("Received MIDI message from TCP: {}", msg);
-                    if let Err(e) = conn_out.send(msg.as_ref()) {
-                        error!("Failed to send MIDI message: {}", e);
-                    }
-                }
-            }
+    let local_set = LocalSet::new();
+    local_set.spawn_local(task);
+    local_set.spawn_local(async move {
+        if let Err(e) = server.run().await {
+            error!("Server error: {}", e);
         }
     });
 
-    // Listen for MIDI messages from TCP
-    if let Some(port) = args.listen_port {
-        info!("Listening for MIDI messages on TCP port {port}...");
-        let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to bind TCP listener: {}", e))?;
-        let tx_out = tx_out.clone();
-        let rx_in = rx_in.resubscribe();
-        tokio::spawn(async move {
-            loop {
-                let (socket, addr) = match listener.accept().await {
-                    Ok(conn) => conn,
-                    Err(e) => {
-                        error!("Failed to accept TCP connection: {}", e);
-                        continue;
-                    }
-                };
-                info!("Accepted TCP connection from {addr}");
-
-                let framed = Framed::new(socket, LengthDelimitedCodec::new());
-                tokio::spawn(handle_connection(
-                    framed,
-                    tx_out.clone(),
-                    rx_in.resubscribe(),
-                ));
-            }
-        });
-    }
-
-    // Connect to TCP servers specified in config
-    if let Some(links_path) = args.links {
-        let config_str = std::fs::read_to_string(&links_path)
-            .map_err(|e| anyhow::anyhow!("failed to read links config file: {}", e))?;
-        let config: midi_proxy::config::Config = toml::from_str(&config_str)
-            .map_err(|e| anyhow::anyhow!("failed to parse links config file: {}", e))?;
+    if let Some(links) = args.config {
+        let config = tokio::fs::read_to_string(links).await?;
+        let config: midi_proxy::config::Config = toml::from_str(&config)?;
 
         for link in config.connection {
-            let target = format!("{}:{}", link.addr, link.port);
-            let tx_out = tx_out.clone();
-            let rx_in = rx_in.resubscribe();
-            tokio::spawn(async move {
-                loop {
-                    println!("[Client] Attempting to connect to {}...", target);
-                    match TcpStream::connect(&target).await {
-                        Ok(socket) => {
-                            println!("[Client] Connected to {}", target);
-                            let framed = Framed::new(socket, LengthDelimitedCodec::new());
-                            // 接続が切れるまで待機
-                            let _ = handle_connection(framed, tx_out.clone(), rx_in.resubscribe())
-                                .await;
-                            println!("[Client] Connection lost. Retrying in 5s...");
-                        }
-                        Err(e) => {
-                            println!("[Client] Connection failed: {}. Retrying in 5s...", e);
-                        }
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                }
-            });
+            let addr = link.addr;
+            let port = link.port;
+            info!("Adding TCP connection to {}:{}", addr, port);
+            let ident = ConnectionIdent::Tcp(addr.parse()?);
+            let framed = Framed::new(
+                TcpStream::connect((addr.as_str(), port)).await?,
+                LengthDelimitedCodec::new(),
+            );
+            let (tx_socket, rx_socket) = mpsc::channel::<OutputMessage>(16);
+            tx.send((ident, MessageDetail::Connection(tx_socket)).into())
+                .await?;
+            // こちらから接続した場合はIn -> Outのルートを作る
+
+            tokio::spawn(handle_connection(framed, ident, tx.clone(), rx_socket));
         }
     }
 
-    let token = CancellationToken::new();
-    token.cancelled().await;
+    if let Some(port) = args.port {
+        let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
+        info!("Listening for TCP connections on port {}", port);
+        let tx = tx.clone();
+        let tcp_task = async move {
+            loop {
+                let (socket, addr) = listener.accept().await?;
+                let ident = ConnectionIdent::Tcp(addr.ip());
+                info!("New TCP connection from {:?} (ident: {:?})", addr, ident);
+                let framed = Framed::new(socket, LengthDelimitedCodec::new());
+                let (tx_socket, rx_socket) = mpsc::channel::<OutputMessage>(16);
+                tx.send((ident, MessageDetail::Connection(tx_socket)).into())
+                    .await?;
+                tokio::spawn(handle_connection(framed, ident, tx.clone(), rx_socket));
+            }
+            #[allow(unreachable_code)]
+            Ok::<(), anyhow::Error>(())
+        };
+        local_set.spawn_local(tcp_task);
+    }
 
+    local_set.await;
+
+    Ok(())
+}
+
+// TCPソケット単位のタスク
+// socketから受信したらIdentをつけて内側へ
+// 内側から来たものはsocketへ送る
+// TODO: Channel書き換えフィルタがあると複数制御しやすい
+async fn handle_connection(
+    mut framed: Framed<TcpStream, LengthDelimitedCodec>,
+    ident: ConnectionIdent,
+    tcp_in: mpsc::Sender<Message>,
+    mut tcp_out: mpsc::Receiver<OutputMessage>,
+) -> anyhow::Result<()> {
+    loop {
+        tokio::select! {
+            Some(result) = framed.next() => {
+                let bytes = result?;
+                tcp_in.send((ident, MessageDetail::MidiMessage(MidiMessage::try_from(bytes.as_ref())?)).into()).await?;
+            }
+            Some(msg) = tcp_out.recv() => {
+                match msg {
+                    OutputMessage::Midi(message) => {
+                        framed.send(Bytes::from(message.as_ref().to_vec())).await?;
+                    }
+                    OutputMessage::Exit => {
+                        info!("Connection {:?} requested exit", ident);
+                        break;
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }

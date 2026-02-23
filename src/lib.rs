@@ -1,12 +1,14 @@
-use std::{fmt::Display, time::Duration};
+use std::{fmt::Display, net::IpAddr, time::Duration};
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
+use midir::{MidiInput, MidiInputConnection, MidiOutput};
 use tokio::{
     net::TcpStream,
     sync::{broadcast, mpsc},
 };
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use tracing::error;
 
 pub mod config;
 pub mod error;
@@ -105,5 +107,184 @@ pub async fn handle_connection(
                 return Err(anyhow::anyhow!("Send error: {}", e));
             }
         }
+    }
+}
+
+/// ルーティングの管理を行う構造体
+pub struct Registry {
+    // 出力へのチャンネル保持。Routerでは町が発生しないように同期で送信する形とする
+    outputs: rustc_hash::FxHashMap<ConnectionIdent, mpsc::Sender<OutputMessage>>,
+    // ルーティングテーブル。入力識別子から出力識別子のリストへのマッピング
+    route_table: rustc_hash::FxHashMap<ConnectionIdent, Vec<ConnectionIdent>>,
+    // MIDI入力の接続情報。Drop回避のために保持を行う
+    _midi_input: Option<MidiInputConnection<()>>,
+}
+
+impl Registry {
+    #[cfg(unix)]
+    pub fn new(
+        name: impl AsRef<str>,
+    ) -> anyhow::Result<(
+        Self,
+        mpsc::Sender<Message>,
+        mpsc::Receiver<Message>,
+        impl std::future::Future<Output = anyhow::Result<()>>,
+    )> {
+        use midir::os::unix::{VirtualInput, VirtualOutput};
+        let (tx, rx) = mpsc::channel::<Message>(16);
+        let name = name.as_ref();
+        let midi_in = MidiInput::new(&format!("{} Input", name))?;
+        let midi_out = MidiOutput::new(&format!("{} Output", name))?;
+
+        // MIDI仮想デバイスを作成して登録
+        let count = midi_in.port_count(); // MIDIデバイスの初期化のために必要
+        let ident = ConnectionIdent::Midi(count as u8); // 仮に現在のポート数を識別子として使用
+        let port_name = format!("{} Input Port", name);
+        let tx_clone = tx.clone();
+        let conn_in = midi_in
+            .create_virtual(
+                &port_name,
+                move |stamp, message, _| {
+                    let msg = MidiMessageStampled::try_from((stamp, message));
+                    match msg {
+                        Ok(msg) => {
+                            use tracing::trace;
+                            trace!(
+                                "Received MIDI message: timestamp={}, message={:?}",
+                                stamp, message
+                            );
+                            let _ = tx_clone.blocking_send(
+                                (ident, MessageDetail::MidiMessage(msg.message)).into(),
+                            );
+                        }
+                        Err(e) => {
+                            let _ = tx_clone
+                                .blocking_send((ident, MessageDetail::Error(e.into())).into());
+                        }
+                    }
+                },
+                (),
+            )
+            .map_err(|e| anyhow::anyhow!("failed to create MIDI Virtual Device: {}", e))?;
+
+        // crate Output構造体を作成して登録
+        let mut conn_out = midi_out
+            .create_virtual(&format!("{} Output Port", name))
+            .map_err(|e| anyhow::anyhow!("failed to create MIDI Virtual Device: {}", e))?;
+        let (tx_midi_out, mut rx_midi_out) = mpsc::channel::<OutputMessage>(16);
+        let task = async move {
+            use tracing::info;
+
+            while let Some(msg) = rx_midi_out.recv().await {
+                match msg {
+                    OutputMessage::Midi(midi) => conn_out.send(midi.as_ref())?,
+                    OutputMessage::Exit => {
+                        break;
+                    }
+                }
+            }
+            info!("MIDI Output task for {:?} is exiting", ident);
+            Ok(())
+        };
+        let outputs = [(ident, tx_midi_out)].into_iter().collect();
+
+        // MIDIIn -> MidiOutは既定で入れる
+        let route_table = [(ident, vec![ident])].into_iter().collect();
+        Ok((
+            Self {
+                outputs,
+                route_table,
+                _midi_input: Some(conn_in),
+            },
+            tx,
+            rx,
+            task,
+        ))
+    }
+}
+
+/// Inputを識別するためのトークン
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConnectionIdent {
+    Midi(u8),
+    Tcp(IpAddr),
+}
+
+/// 出力構造体
+///
+/// 入力はそれぞれのタスクで実行され、コールバックからはこれらの構造体を通じてMIDIメッセージを送信する。
+pub struct Server {
+    registry: Registry,
+    rx: mpsc::Receiver<Message>,
+}
+
+impl Server {
+    pub fn new(registry: Registry, rx: mpsc::Receiver<Message>) -> Self {
+        Self { registry, rx }
+    }
+
+    pub async fn run(&mut self) -> anyhow::Result<()> {
+        loop {
+            if let Some(msg) = self.rx.recv().await {
+                match msg.message {
+                    MessageDetail::MidiMessage(midi_msg) => {
+                        let r = &self.registry;
+                        if let Some(outputs) = r.route_table.get(&msg.ident) {
+                            for output_ident in outputs {
+                                if let Some(output) = r.outputs.get(output_ident)
+                                    && let Err(e) = output.try_send(midi_msg.into())
+                                {
+                                    error!("Failed to send MIDI message: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    MessageDetail::Connection(tx) => {
+                        self.registry.outputs.insert(msg.ident, tx);
+                    }
+                    MessageDetail::Disconnection(_ident) => {
+                        // 切断の処理（必要に応じてルーティングを更新）
+                    }
+                    MessageDetail::Error(e) => {
+                        error!("Error from connection {:?}: {}", msg.ident, e);
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub struct Message {
+    ident: ConnectionIdent,
+    message: MessageDetail,
+}
+
+impl From<(ConnectionIdent, MessageDetail)> for Message {
+    fn from((ident, message): (ConnectionIdent, MessageDetail)) -> Self {
+        Self { ident, message }
+    }
+}
+
+pub enum MessageDetail {
+    Connection(mpsc::Sender<OutputMessage>),
+    Disconnection(ConnectionIdent),
+    MidiMessage(MidiMessage),
+    Error(anyhow::Error),
+}
+
+pub enum Input {
+    /// MIDI仮想デバイスへの入力
+    MidiVirtual(MidiInputConnection<()>),
+}
+
+/// Output制御メッセージ
+pub enum OutputMessage {
+    Midi(MidiMessage),
+    Exit,
+}
+
+impl From<MidiMessage> for OutputMessage {
+    fn from(midi: MidiMessage) -> Self {
+        Self::Midi(midi)
     }
 }

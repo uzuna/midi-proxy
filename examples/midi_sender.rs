@@ -11,10 +11,10 @@ struct Args {
     #[arg(short, long)]
     list_ports: bool,
 
-    #[arg(short, long)]
+    #[arg(short = 'i', long)]
     output_port: Option<usize>,
 
-    #[arg(short, long, default_value_t = 500)]
+    #[arg(short = 't', long, default_value_t = 500)]
     interval_us: u64,
 
     #[arg(short, long, default_value_t = 16)]
