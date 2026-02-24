@@ -8,6 +8,5 @@ pub struct Config {
 /// TCP接続情報を表す構造体
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TcpLinkInfo {
-    pub addr: String,
-    pub port: u16,
+    pub host: String,
 }

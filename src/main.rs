@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use bytes::Bytes;
 use clap::Parser;
@@ -58,19 +58,18 @@ async fn main() -> anyhow::Result<()> {
         let config: midi_proxy::config::Config = toml::from_str(&config)?;
 
         for link in config.connection {
-            let addr = link.addr;
-            let port = link.port;
-            info!("Adding TCP connection to {}:{}", addr, port);
-            let ident = ConnectionIdent::Tcp(addr.parse()?);
-            let framed = Framed::new(
-                TcpStream::connect((addr.as_str(), port)).await?,
-                LengthDelimitedCodec::new(),
-            );
+            let host = tokio::net::lookup_host(&link.host).await?;
+            let addr = host
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("DNS resolution did not yield any addresses"))?;
+            info!("Adding TCP connection to {}", addr);
+            let ident = ConnectionIdent::Tcp((Arc::new(link.host.clone()), addr.ip(), addr.port()));
+            let framed = Framed::new(TcpStream::connect(addr).await?, LengthDelimitedCodec::new());
             let (tx_socket, rx_socket) = mpsc::channel::<OutputMessage>(16);
-            tx.send((ident, MessageDetail::Connection(tx_socket)).into())
+            tx.send((ident.clone(), MessageDetail::Connection(tx_socket)).into())
                 .await?;
             // こちらから接続した場合はIn -> Outのルートを作る
-
             tokio::spawn(handle_connection(framed, ident, tx.clone(), rx_socket));
         }
     }
@@ -82,11 +81,12 @@ async fn main() -> anyhow::Result<()> {
         let tcp_task = async move {
             loop {
                 let (socket, addr) = listener.accept().await?;
-                let ident = ConnectionIdent::Tcp(addr.ip());
+                let ident =
+                    ConnectionIdent::Tcp((Arc::new("".to_string()), addr.ip(), addr.port()));
                 info!("New TCP connection from {:?} (ident: {:?})", addr, ident);
                 let framed = Framed::new(socket, LengthDelimitedCodec::new());
                 let (tx_socket, rx_socket) = mpsc::channel::<OutputMessage>(16);
-                tx.send((ident, MessageDetail::Connection(tx_socket)).into())
+                tx.send((ident.clone(), MessageDetail::Connection(tx_socket)).into())
                     .await?;
                 tokio::spawn(handle_connection(framed, ident, tx.clone(), rx_socket));
             }
@@ -115,7 +115,7 @@ async fn handle_connection(
         tokio::select! {
             Some(result) = framed.next() => {
                 let bytes = result?;
-                tcp_in.send((ident, MessageDetail::MidiMessage(MidiMessage::try_from(bytes.as_ref())?)).into()).await?;
+                tcp_in.send((ident.clone(), MessageDetail::MidiMessage(MidiMessage::try_from(bytes.as_ref())?)).into()).await?;
             }
             Some(msg) = tcp_out.recv() => {
                 match msg {

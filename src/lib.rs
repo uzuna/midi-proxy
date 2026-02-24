@@ -1,4 +1,4 @@
-use std::{fmt::Display, net::IpAddr, time::Duration};
+use std::{fmt::Display, net::IpAddr, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
@@ -141,6 +141,7 @@ impl Registry {
         let ident = ConnectionIdent::Midi(count as u8); // 仮に現在のポート数を識別子として使用
         let port_name = format!("{} Input Port", name);
         let tx_clone = tx.clone();
+        let ident_clone = ident.clone();
         let conn_in = midi_in
             .create_virtual(
                 &port_name,
@@ -154,12 +155,14 @@ impl Registry {
                                 stamp, message
                             );
                             let _ = tx_clone.blocking_send(
-                                (ident, MessageDetail::MidiMessage(msg.message)).into(),
+                                (ident_clone.clone(), MessageDetail::MidiMessage(msg.message))
+                                    .into(),
                             );
                         }
                         Err(e) => {
-                            let _ = tx_clone
-                                .blocking_send((ident, MessageDetail::Error(e.into())).into());
+                            let _ = tx_clone.blocking_send(
+                                (ident_clone.clone(), MessageDetail::Error(e.into())).into(),
+                            );
                         }
                     }
                 },
@@ -172,6 +175,7 @@ impl Registry {
             .create_virtual(&format!("{} Output Port", name))
             .map_err(|e| anyhow::anyhow!("failed to create MIDI Virtual Device: {}", e))?;
         let (tx_midi_out, mut rx_midi_out) = mpsc::channel::<OutputMessage>(16);
+        let ident_clone = ident.clone();
         let task = async move {
             use tracing::info;
 
@@ -183,13 +187,13 @@ impl Registry {
                     }
                 }
             }
-            info!("MIDI Output task for {:?} is exiting", ident);
+            info!("MIDI Output task for {:?} is exiting", ident_clone);
             Ok(())
         };
-        let outputs = [(ident, tx_midi_out)].into_iter().collect();
+        let outputs = [(ident.clone(), tx_midi_out)].into_iter().collect();
 
         // MIDIIn -> MidiOutは既定で入れる
-        let route_table = [(ident, vec![ident])].into_iter().collect();
+        let route_table = [(ident.clone(), vec![ident.clone()])].into_iter().collect();
         Ok((
             Self {
                 outputs,
@@ -204,10 +208,10 @@ impl Registry {
 }
 
 /// Inputを識別するためのトークン
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ConnectionIdent {
     Midi(u8),
-    Tcp(IpAddr),
+    Tcp((Arc<String>, IpAddr, u16)),
 }
 
 /// 出力構造体
