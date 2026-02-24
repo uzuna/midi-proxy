@@ -8,7 +8,7 @@ use tokio::{
     sync::{broadcast, mpsc},
 };
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
-use tracing::error;
+use tracing::{error, info};
 
 pub mod config;
 pub mod error;
@@ -118,6 +118,8 @@ pub struct Registry {
     route_table: rustc_hash::FxHashMap<ConnectionIdent, Vec<ConnectionIdent>>,
     // MIDI入力の接続情報。Drop回避のために保持を行う
     _midi_input: Option<MidiInputConnection<()>>,
+    // 自身のMIDI Outに必ず送るために覚えておく
+    local_midi_out: ConnectionIdent,
 }
 
 impl Registry {
@@ -136,9 +138,17 @@ impl Registry {
         let midi_in = MidiInput::new(&format!("{} Input", name))?;
         let midi_out = MidiOutput::new(&format!("{} Output", name))?;
 
+        for x in midi_in.ports() {
+            info!("Existing MIDI input port: {}", midi_in.port_name(&x)?);
+        }
+
         // MIDI仮想デバイスを作成して登録
         let count = midi_in.port_count(); // MIDIデバイスの初期化のために必要
         let ident = ConnectionIdent::Midi(count as u8); // 仮に現在のポート数を識別子として使用
+        info!(
+            "Creating MIDI virtual device with ident {:?} ({} existing ports)",
+            ident, count,
+        );
         let port_name = format!("{} Input Port", name);
         let tx_clone = tx.clone();
         let ident_clone = ident.clone();
@@ -154,15 +164,14 @@ impl Registry {
                                 "Received MIDI message: timestamp={}, message={:?}",
                                 stamp, message
                             );
-                            let _ = tx_clone.blocking_send(
-                                (ident_clone.clone(), MessageDetail::MidiMessage(msg.message))
-                                    .into(),
-                            );
+                            let _ = tx_clone.blocking_send(Message::MidiMessage((
+                                ident_clone.clone(),
+                                msg.message,
+                            )));
                         }
                         Err(e) => {
-                            let _ = tx_clone.blocking_send(
-                                (ident_clone.clone(), MessageDetail::Error(e.into())).into(),
-                            );
+                            let _ = tx_clone
+                                .blocking_send(Message::Error((ident_clone.clone(), e.into())));
                         }
                     }
                 },
@@ -199,11 +208,22 @@ impl Registry {
                 outputs,
                 route_table,
                 _midi_input: Some(conn_in),
+                local_midi_out: ident.clone(),
             },
             tx,
             rx,
             task,
         ))
+    }
+
+    fn add_connection(&mut self, ident: ConnectionIdent, tx: mpsc::Sender<OutputMessage>) {
+        info!("Added connection {:?}", ident);
+        self.outputs.insert(ident.clone(), tx);
+    }
+
+    /// ローカルMIDI出力の識別子を取得する
+    pub fn get_local_midi_out_ident(&self) -> &ConnectionIdent {
+        &self.local_midi_out
     }
 }
 
@@ -230,10 +250,10 @@ impl Server {
     pub async fn run(&mut self) -> anyhow::Result<()> {
         loop {
             if let Some(msg) = self.rx.recv().await {
-                match msg.message {
-                    MessageDetail::MidiMessage(midi_msg) => {
+                match msg {
+                    Message::MidiMessage((ident, midi_msg)) => {
                         let r = &self.registry;
-                        if let Some(outputs) = r.route_table.get(&msg.ident) {
+                        if let Some(outputs) = r.route_table.get(&ident) {
                             for output_ident in outputs {
                                 if let Some(output) = r.outputs.get(output_ident)
                                     && let Err(e) = output.try_send(midi_msg.into())
@@ -243,14 +263,25 @@ impl Server {
                             }
                         }
                     }
-                    MessageDetail::Connection(tx) => {
-                        self.registry.outputs.insert(msg.ident, tx);
+                    Message::Connection((ident, tx)) => {
+                        self.registry.add_connection(ident, tx);
                     }
-                    MessageDetail::Disconnection(_ident) => {
+                    Message::Disconnection(ident) => {
                         // 切断の処理（必要に応じてルーティングを更新）
+                        self.registry.outputs.remove(&ident);
+                        self.registry.route_table.remove(&ident);
+                        self.registry
+                            .route_table
+                            .values_mut()
+                            .for_each(|routes| routes.retain(|x| x != &ident));
+                        info!("Removed connection {:?}", ident);
                     }
-                    MessageDetail::Error(e) => {
-                        error!("Error from connection {:?}: {}", msg.ident, e);
+                    Message::Error((ident, e)) => {
+                        error!("Error from connection {:?}: {}", ident, e);
+                    }
+                    Message::Link((from, to)) => {
+                        // ルーティングの更新
+                        self.registry.route_table.entry(from).or_default().push(to);
                     }
                 }
             }
@@ -258,22 +289,17 @@ impl Server {
     }
 }
 
-pub struct Message {
-    ident: ConnectionIdent,
-    message: MessageDetail,
-}
-
-impl From<(ConnectionIdent, MessageDetail)> for Message {
-    fn from((ident, message): (ConnectionIdent, MessageDetail)) -> Self {
-        Self { ident, message }
-    }
-}
-
-pub enum MessageDetail {
-    Connection(mpsc::Sender<OutputMessage>),
+pub enum Message {
+    // 接続識別子と送信チャネル
+    Connection((ConnectionIdent, mpsc::Sender<OutputMessage>)),
+    // 転送元と転送先
+    Link((ConnectionIdent, ConnectionIdent)),
+    // 切断
     Disconnection(ConnectionIdent),
-    MidiMessage(MidiMessage),
-    Error(anyhow::Error),
+    // MIDIメッセージ
+    MidiMessage((ConnectionIdent, MidiMessage)),
+    // エラー
+    Error((ConnectionIdent, anyhow::Error)),
 }
 
 pub enum Input {

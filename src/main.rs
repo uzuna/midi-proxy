@@ -3,9 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 use bytes::Bytes;
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
-use midi_proxy::{
-    ConnectionIdent, Message, MessageDetail, MidiMessage, OutputMessage, Registry, Server,
-};
+use midi_proxy::{ConnectionIdent, Message, MidiMessage, OutputMessage, Registry, Server};
 use tokio::{net::TcpStream, sync::mpsc, task::LocalSet};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing::{error, info};
@@ -43,6 +41,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let (reg, tx, rx, task) = Registry::new(args.name)?;
+    let this_ident = reg.get_local_midi_out_ident().clone();
     let mut server = Server::new(reg, rx);
 
     let local_set = LocalSet::new();
@@ -67,9 +66,11 @@ async fn main() -> anyhow::Result<()> {
             let ident = ConnectionIdent::Tcp((Arc::new(link.host.clone()), addr.ip(), addr.port()));
             let framed = Framed::new(TcpStream::connect(addr).await?, LengthDelimitedCodec::new());
             let (tx_socket, rx_socket) = mpsc::channel::<OutputMessage>(16);
-            tx.send((ident.clone(), MessageDetail::Connection(tx_socket)).into())
+            tx.send(Message::Connection((ident.clone(), tx_socket)))
                 .await?;
-            // こちらから接続した場合はIn -> Outのルートを作る
+            // 自身のMIDIから相手へのルートを作る
+            tx.send(Message::Link((this_ident.clone(), ident.clone())))
+                .await?;
             tokio::spawn(handle_connection(framed, ident, tx.clone(), rx_socket));
         }
     }
@@ -86,7 +87,10 @@ async fn main() -> anyhow::Result<()> {
                 info!("New TCP connection from {:?} (ident: {:?})", addr, ident);
                 let framed = Framed::new(socket, LengthDelimitedCodec::new());
                 let (tx_socket, rx_socket) = mpsc::channel::<OutputMessage>(16);
-                tx.send((ident.clone(), MessageDetail::Connection(tx_socket)).into())
+                tx.send(Message::Connection((ident.clone(), tx_socket)))
+                    .await?;
+                // 接続してきたものは自身のMIDI Outにルートを作る
+                tx.send(Message::Link((ident.clone(), this_ident.clone())))
                     .await?;
                 tokio::spawn(handle_connection(framed, ident, tx.clone(), rx_socket));
             }
@@ -115,7 +119,7 @@ async fn handle_connection(
         tokio::select! {
             Some(result) = framed.next() => {
                 let bytes = result?;
-                tcp_in.send((ident.clone(), MessageDetail::MidiMessage(MidiMessage::try_from(bytes.as_ref())?)).into()).await?;
+                tcp_in.send(Message::MidiMessage((ident.clone(), MidiMessage::try_from(bytes.as_ref())?))).await?;
             }
             Some(msg) = tcp_out.recv() => {
                 match msg {
